@@ -24,12 +24,16 @@ use tokio::time::sleep;
 struct Args {
     #[arg(long)]
     url: String,
+    #[arg(long, num_args = 1.., value_delimiter = ',')]
+    account: Vec<String>,
     #[arg(long)]
-    account: String,
+    accounts: Option<String>,
     #[arg(long)]
-    slot: u64,
+    slot: Option<u64>,
     #[arg(long)]
-    distance: u64,
+    distance: Option<u64>,
+    #[arg(long)]
+    range: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,24 +209,96 @@ async fn get_leader_map_with_retry(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Collect all accounts from command line and JSON file
+    let mut all_accounts = args.account.clone();
+    
+    if let Some(accounts_file) = &args.accounts {
+        let file_content = std::fs::read_to_string(accounts_file)
+            .context(format!("Failed to read accounts file: {}", accounts_file))?;
+        
+        let file_accounts: Vec<String> = serde_json::from_str(&file_content)
+            .context(format!("Failed to parse JSON from accounts file: {}", accounts_file))?;
+        
+        all_accounts.extend(file_accounts);
+    }
+
+    // Remove duplicates while preserving order
+    let mut seen = std::collections::HashSet::new();
+    let mut unique_accounts = Vec::new();
+    for account in all_accounts {
+        if seen.insert(account.clone()) {
+            unique_accounts.push(account);
+        }
+    }
+
+    if unique_accounts.is_empty() {
+        anyhow::bail!("No accounts specified. Use --account or --accounts to specify at least one account.");
+    }
+
+    let slot_info = if args.range.is_some() {
+        format!("Range file: {}", args.range.as_ref().unwrap())
+    } else {
+        let slot = args.slot.unwrap_or(0);
+        let distance = args.distance.unwrap_or(0);
+        format!("Slot: {} Distance: {}", slot, distance)
+    };
+
     println!(
-        "\n{}\n{} {}  {} {}\n{}\n",
+        "\n{}\n{}  {} {}\n{}\n",
         "==============================".bright_black(),
-        "Slot:".bold(),
-        args.slot.to_string().yellow(),
-        "Distance:".bold(),
-        args.distance.to_string().yellow(),
+        slot_info.bold(),
+        "Accounts:".bold(),
+        unique_accounts.len().to_string().yellow(),
         "==============================".bright_black()
     );
 
-    let leader_map = get_leader_map_with_retry(&args.url, args.slot, 5)
+    // Determine which slots to process
+    let slots_to_process: Vec<u64> = if let Some(range_file) = &args.range {
+        // Load slots from JSON file
+        let file_content = std::fs::read_to_string(range_file)
+            .context(format!("Failed to read range file: {}", range_file))?;
+        
+        let slots: Vec<u64> = serde_json::from_str(&file_content)
+            .context(format!("Failed to parse JSON from range file: {}", range_file))?;
+        
+        slots
+    } else {
+        // Use original slot + distance logic
+        let slot = args.slot.ok_or_else(|| anyhow::anyhow!("--slot is required when not using --range"))?;
+        let distance = args.distance.ok_or_else(|| anyhow::anyhow!("--distance is required when not using --range"))?;
+        
+        let mut slots = Vec::new();
+        for offset in 0..=distance {
+            slots.push(slot.saturating_sub(offset));
+        }
+        slots
+    };
+
+    // Use the first slot for leader schedule (or a default if using range)
+    let reference_slot = if let Some(range_file) = &args.range {
+        // Load first slot from range file for leader schedule
+        let file_content = std::fs::read_to_string(range_file)
+            .context(format!("Failed to read range file: {}", range_file))?;
+        
+        let slots: Vec<u64> = serde_json::from_str(&file_content)
+            .context(format!("Failed to parse JSON from range file: {}", range_file))?;
+        
+        *slots.first().ok_or_else(|| anyhow::anyhow!("Range file is empty"))?
+    } else {
+        args.slot.ok_or_else(|| anyhow::anyhow!("--slot is required when not using --range"))?
+    };
+
+    let leader_map = get_leader_map_with_retry(&args.url, reference_slot, 5)
         .await
         .context("Could not fetch leader schedule (rate limited or RPC error). Exiting.")?;
 
     let http_client = Client::new();
+    
+    // Track missed votes for each account
+    let mut missed_votes_count: HashMap<String, u32> = HashMap::new();
+    let total_slots = slots_to_process.len();
 
-    for offset in 0..=args.distance {
-        let current_slot = args.slot.saturating_sub(offset);
+    for current_slot in slots_to_process {
 
         let block_result = get_block_with_retry(&http_client, &args.url, current_slot, 5).await;
 
@@ -232,135 +308,53 @@ async fn main() -> Result<()> {
                 let vote_count = vote_txs.len();
 
                 let mut matches = vec![];
+                let mut found_accounts = std::collections::HashSet::new();
                 for (i, tx) in vote_txs.iter().enumerate() {
                     if let Some(account) = tx.transaction.message.account_keys.get(0) {
-                        if account == &args.account {
-                            matches.push((i, tx));
+                        if unique_accounts.contains(account) {
+                            matches.push((i, tx, account.clone()));
+                            found_accounts.insert(account.clone());
                         }
                     }
                 }
+
+
 
                 let leader_info = leader_map
                     .get(&current_slot)
                     .map(|l| format!("{}", l))
                     .unwrap_or_else(|| "unknown".to_string());
 
-                if !matches.is_empty() {
-                    println!(
-                        "\n{:<7} {:<10} {:<7} {:<6} {:<8} {}\n",
-                        "Slot:".bold(),
-                        current_slot.to_string().green(),
-                        "Votes:".bold(),
-                        vote_count.to_string().cyan(),
-                        "Leader:".bold(),
-                        leader_info.bright_black()
-                    );
+                println!(
+                    "\n{:<7} {:<10} {:<7} {:<6} {:<8} {}",
+                    "Slot:".bold(),
+                    current_slot.to_string().green(),
+                    "Votes:".bold(),
+                    vote_count.to_string().cyan(),
+                    "Leader:".bold(),
+                    leader_info.bright_black()
+                );
 
-                    let mut rng = rand::rng();
-
-                    for (i, tx) in matches {
-                        let sig = &tx.transaction.signatures[0];
-
-                        let mut attempts = 0;
-                        let max_attempts = 5;
-                        let mut delay = Duration::from_secs(3);
-                        let voted_slot_result;
-                        let mut rate_limit_lines = 0;
-
-                        loop {
-                            if attempts > 0 {
-                                let jitter = rng.random_range(3000..=5000);
-                                sleep(delay + Duration::from_millis(jitter)).await;
-                                delay *= 2;
-                            }
-
-                            let pb = ProgressBar::new_spinner();
-                            pb.set_style(
-                                ProgressStyle::default_spinner()
-                                    .template("{spinner} {msg}")
-                                    .unwrap(),
-                            );
-                            pb.set_message("Fetching transaction details...");
-                            pb.enable_steady_tick(Duration::from_millis(80));
-
-                            let result = extract_voted_slot(&args.url, sig).await;
-
-                            pb.finish_and_clear();
-
-                            match &result {
-                                Ok(Some(_)) | Ok(None) => {
-                                    if rate_limit_lines > 0 {
-                                        for _ in 0..rate_limit_lines {
-                                            print!("\x1b[1A\x1b[2K");
-                                        }
-                                        print!("\r");
-                                        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-                                    }
-                                    voted_slot_result = result;
-                                    break;
-                                }
-                                Err(e) => {
-                                    let is_rate_limited = e.to_string().contains("429");
-                                    attempts += 1;
-                                    if is_rate_limited && attempts < max_attempts {
-                                        println!(
-                                            "{} Retrying in {:?}... (attempt {}/{})",
-                                            "Rate limited (429).".yellow(),
-                                            delay,
-                                            attempts,
-                                            max_attempts
-                                        );
-                                        rate_limit_lines += 1;
-                                        continue;
-                                    } else {
-                                        if rate_limit_lines > 0 {
-                                            for _ in 0..rate_limit_lines {
-                                                print!("\x1b[1A\x1b[2K");
-                                            }
-                                            print!("\r");
-                                            std::io::Write::flush(&mut std::io::stdout()).unwrap();
-                                        }
-                                        voted_slot_result = result;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        println!("{:<12} {}", "Signature:", sig.dimmed());
-
-                        match voted_slot_result {
-                            Ok(Some(vote_slot)) => println!(
-                                "{:<12} {}",
-                                "Voted slot:",
-                                vote_slot.to_string().bright_yellow()
-                            ),
-                            Ok(None) => println!("{:<12} {}", "Voted slot:", "[unknown]".dimmed()),
-                            Err(e) => println!(
-                                "{:<12} {} {}",
-                                "[error]".red(),
-                                sig.dimmed(),
-                                format!("({})", e).dimmed()
-                            ),
-                        }
-
-                        println!("{:<12} {}\n", "Position:", i.to_string().bright_blue());
-
-                        sleep(Duration::from_millis(300)).await;
-                        let jitter = rng.random_range(3000..=5000);
-                        sleep(Duration::from_millis(jitter)).await;
+                // Show all accounts with their status and track missed votes
+                let mut missed_in_slot = Vec::new();
+                for account in &unique_accounts {
+                    if found_accounts.contains(account) {
+                        // COMMENTED OUT: Successful vote display
+                        // Find the position for this account
+                        // if let Some((position, _, _)) = matches.iter().find(|(_, tx, acc)| acc == account) {
+                        //     println!("  {} {}", account, position.to_string().bright_blue());
+                        // }
+                    } else {
+                        println!("  {} {}", account, "[X]".red());
+                        missed_in_slot.push(account.clone());
+                        *missed_votes_count.entry(account.clone()).or_insert(0) += 1;
                     }
-                } else {
-                    println!(
-                        "\n{:<7} {:<10} {:<7} {:<6} {:<8} {} {}\n",
-                        "Slot:".bold(),
-                        current_slot.to_string().green(),
-                        "Votes:".bold(),
-                        vote_count.to_string().cyan(),
-                        "[X]".red(),
-                        "Leader:".bold(),
-                        leader_info.bright_black()
-                    );
+                }
+                
+                // Output missed votes summary for this slot
+                if !missed_in_slot.is_empty() {
+                    println!("  {} missed votes: {}", "Missed:".bold().red(), missed_in_slot.len());
+                    println!("  {}", missed_in_slot.join(", ").red());
                 }
             }
             Ok(None) => {
@@ -403,6 +397,29 @@ async fn main() -> Result<()> {
     }
 
     println!("{}", "\nAll done!".bright_green());
+    
+    // Output final missed votes summary
+    println!("\n{}", "=".repeat(60).bright_black());
+    println!("{}", "FINAL SUMMARY".bold());
+    println!("{}", "=".repeat(60).bright_black());
+    println!("  Total slots processed: {}", total_slots.to_string().cyan());
+    
+    if !missed_votes_count.is_empty() {
+        println!("\n{}", "MISSED VOTES SUMMARY".bold().red());
+        
+        // Sort by missed vote count (descending)
+        let mut sorted_missed: Vec<_> = missed_votes_count.iter().collect();
+        sorted_missed.sort_by(|a, b| b.1.cmp(a.1));
+        
+        for (account, count) in sorted_missed {
+            println!("  {}: {} missed votes", account, count.to_string().red());
+        }
+    } else {
+        println!("\n{}", "No missed votes found!".bold().green());
+    }
+    
+    println!("{}", "=".repeat(60).bright_black());
+    
     println!();
     Ok(())
 }
