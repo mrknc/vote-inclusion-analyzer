@@ -15,6 +15,7 @@ use solana_program::vote::state::Vote;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
+use std::fs;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -252,6 +253,16 @@ async fn main() -> Result<()> {
         "==============================".bright_black()
     );
 
+    // Load Jito batch accounts from jito200.json
+    let jito_accounts: std::collections::HashSet<String> = {
+        let jito_json = fs::read_to_string("jito200.json")
+            .context("Failed to read jito200.json")?;
+        serde_json::from_str::<Vec<String>>(&jito_json)
+            .context("Failed to parse jito200.json")?
+            .into_iter()
+            .collect()
+    };
+
     // Determine which slots to process
     let slots_to_process: Vec<u64> = if let Some(range_file) = &args.range {
         // Load slots from JSON file
@@ -296,6 +307,9 @@ async fn main() -> Result<()> {
     
     // Track missed votes for each account
     let mut missed_votes_count: HashMap<String, u32> = HashMap::new();
+    let mut missed_votes_jito_count: HashMap<String, u32> = HashMap::new();
+    let mut total_jito_misses = 0u32;
+    let mut total_misses = 0u32;
     let total_slots = slots_to_process.len();
 
     for current_slot in slots_to_process {
@@ -337,24 +351,34 @@ async fn main() -> Result<()> {
 
                 // Show all accounts with their status and track missed votes
                 let mut missed_in_slot = Vec::new();
+                let mut missed_in_slot_jito = Vec::new();
                 for account in &unique_accounts {
-                    if found_accounts.contains(account) {
-                        // COMMENTED OUT: Successful vote display
-                        // Find the position for this account
-                        // if let Some((position, _, _)) = matches.iter().find(|(_, tx, acc)| acc == account) {
-                        //     println!("  {} {}", account, position.to_string().bright_blue());
-                        // }
-                    } else {
-                        println!("  {} {}", account, "[X]".red());
+                    if !found_accounts.contains(account) {
+                        let is_jito = jito_accounts.contains(account);
+                        if is_jito {
+                            missed_in_slot_jito.push(account.clone());
+                            *missed_votes_jito_count.entry(account.clone()).or_insert(0) += 1;
+                            total_jito_misses += 1;
+                        }
                         missed_in_slot.push(account.clone());
                         *missed_votes_count.entry(account.clone()).or_insert(0) += 1;
+                        total_misses += 1;
+                        println!("  {} {}{}", if is_jito {"[J]"} else {"   "}, account, " [X]".red());
                     }
                 }
                 
                 // Output missed votes summary for this slot
                 if !missed_in_slot.is_empty() {
-                    println!("  {} missed votes: {}", "Missed:".bold().red(), missed_in_slot.len());
-                    println!("  {}", missed_in_slot.join(", ").red());
+                    let jito_ratio = if missed_in_slot.len() > 0 {
+                        missed_in_slot_jito.len() as f64 / missed_in_slot.len() as f64
+                    } else { 0.0 };
+                    println!(
+                        "  {} skipped votes: {} (Jito: {}, ratio: {:.2})",
+                        "Skipped:".bold().red(),
+                        missed_in_slot.len(),
+                        missed_in_slot_jito.len(),
+                        jito_ratio
+                    );
                 }
             }
             Ok(None) => {
@@ -405,22 +429,31 @@ async fn main() -> Result<()> {
     println!("  Total slots processed: {}", total_slots.to_string().cyan());
     
     if !missed_votes_count.is_empty() {
-        println!("\n{}", "MISSED VOTES SUMMARY".bold().red());
+        println!("\n{}", "SKIPPED VOTES SUMMARY".bold().red());
         
         // Sort by missed vote count (descending)
         let mut sorted_missed: Vec<_> = missed_votes_count.iter().collect();
         sorted_missed.sort_by(|a, b| b.1.cmp(a.1));
         
         for (account, count) in sorted_missed {
-            println!("  {}: {} missed votes", account, count.to_string().red());
+            let is_jito = jito_accounts.contains(account);
+            let jito_tag = if is_jito { "[J] " } else { "    " };
+            let jito_count = missed_votes_jito_count.get(account).cloned().unwrap_or(0);
+            let ratio = if *count > 0 { jito_count as f64 / *count as f64 } else { 0.0 };
+            println!("  {}{}: {} skipped votes", jito_tag, account, count.to_string().red() );
         }
     } else {
-        println!("\n{}", "No missed votes found!".bold().green());
+        println!("\n{}", "No skipped votes found!".bold().green());
     }
     
     println!("{}", "=".repeat(60).bright_black());
     
     println!();
+    println!("Total skipped votes: {}", total_misses);
+    println!("Jito skipped votes: {}", total_jito_misses);
+    let total_ratio = if total_misses > 0 { total_jito_misses as f64 / total_misses as f64 } else { 0.0 };
+    println!("Jito/Total ratio: {:.2}", total_ratio);
+    
     Ok(())
 }
 
