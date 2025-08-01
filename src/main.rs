@@ -591,7 +591,7 @@ async fn extract_voted_slot(rpc_url: &str, signature: &str) -> Result<Option<u64
                     return Ok(Some(*slot));
                 }
             }
-            Ok(VoteInstruction::TowerSync(sync)) => {
+            Ok(VoteInstruction::TowerSync(sync) | VoteInstruction::TowerSyncSwitch(sync, _)) => {
                 if let Some(lockout) = sync.lockouts.iter().find(|l| l.confirmation_count() == 1) {
                     return Ok(Some(lockout.slot()));
                 }
